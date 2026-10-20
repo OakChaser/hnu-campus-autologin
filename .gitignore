@@ -1,0 +1,6 @@
+.DS_Store
+*.log
+*.tmp
+hnu-campus.conf
+hnu-campus.conf.local
+tests/tmp/

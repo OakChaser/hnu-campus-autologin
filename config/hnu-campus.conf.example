@@ -1,0 +1,64 @@
+# HNU campus network auto-login configuration.
+# Install path: /etc/hnu-campus.conf
+# Keep this file mode 600: it contains your plain-text password.
+
+ENABLED=1
+
+# Account and password for the HNU unified identity service.
+# Use single quotes so characters such as $, `, and \ are kept literally.
+USERNAME='你的学号'
+PASSWORD='你的统一身份认证密码'
+
+# HNU uses ",1," before the student ID. Keep this unless the portal changes.
+ACCOUNT_PREFIX=',1,'
+# Leave empty for the campus network. Use @telecom / @cmcc / @unicom if needed.
+ISP_SUFFIX=''
+
+# Dr.COM ePortal endpoint.
+PORTAL_SCHEME='http'
+PORTAL_HOST='10.2.68.30'
+PORTAL_PORT='801'
+PORTAL_LOGIN_PATH='/eportal/portal/login'
+PORTAL_LOGOUT_PATH='/eportal/portal/logout'
+REFERER='http://10.2.68.30/'
+
+# OpenWrt logical WAN interface. The script also auto-detects the source IP.
+WAN_IF='wan'
+# Leave empty to auto-detect. Set a fixed IPv4 only if auto-detection is wrong.
+WAN_IP=''
+# 000000000000 matches the portal request used by HNU. "auto" uses the WAN MAC.
+USER_MAC='000000000000'
+AC_IP=''
+AC_NAME=''
+
+# Portal request parameters.
+LOGIN_METHOD='1'
+TERMINAL_TYPE='2'
+JS_VERSION='4.2.1'
+VERSION_PARAM='2012'
+CALLBACK='dr1003'
+
+# Watchdog timings, in seconds.
+CHECK_INTERVAL='60'
+OFFLINE_CONFIRM='2'
+RETRY_BASE='30'
+RETRY_MAX='600'
+AUTH_COOLDOWN='1800'
+LIMIT_COOLDOWN='600'
+BLOCKED_COOLDOWN='1800'
+# Forced re-login every N hours as a safety net. Set 0 to disable.
+FORCE_RELOGIN_HOURS='6'
+
+# HTTP timeouts.
+HTTP_TIMEOUT='10'
+HTTP_CONNECT_TIMEOUT='5'
+
+# Online probes. The first endpoint returning its expected payload means online.
+CHECK_URLS='http://connect.rom.miui.com/generate_204 http://connectivitycheck.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt http://www.msftconnecttest.com/connecttest.txt http://captive.apple.com/hotspot-detect.html'
+
+# Persistent log. Syslog is also written when logger is available.
+LOG_FILE='/etc/hnu-campus.log'
+LOG_MAX_KB='256'
+
+# Mobile Edge user agent used by the web portal.
+UA='Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36 EdgA/138.0.0.0'
