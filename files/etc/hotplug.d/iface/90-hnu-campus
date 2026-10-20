@@ -1,0 +1,21 @@
+#!/bin/sh
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ -x /usr/sbin/hnu-campus ] || exit 0
+
+WAN_IF='wan'
+if [ -r /etc/hnu-campus.conf ]; then
+    . /etc/hnu-campus.conf
+fi
+
+[ "$INTERFACE" = "wan6" ] && exit 0
+
+case "$INTERFACE" in
+    "$WAN_IF"|wwan)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+( /usr/sbin/hnu-campus check --quiet ) >/dev/null 2>&1 &

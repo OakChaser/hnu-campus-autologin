@@ -1,0 +1,1232 @@
+#!/bin/sh
+
+set -u
+umask 077
+
+PATH=${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+for _path_dir in /usr/sbin /usr/bin /sbin /bin; do
+    case ":$PATH:" in
+        *":$_path_dir:"*)
+            ;;
+        *)
+            PATH="$PATH:$_path_dir"
+            ;;
+    esac
+done
+export PATH
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY 2>/dev/null || true
+
+SELF_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)
+COMMON_SH=${HNU_CAMPUS_COMMON:-}
+
+if [ -z "$COMMON_SH" ]; then
+    for _common in \
+        /usr/share/hnu-campus/common.sh \
+        "$SELF_DIR/../share/hnu-campus/common.sh" \
+        "$SELF_DIR/common.sh"
+    do
+        if [ -r "$_common" ]; then
+            COMMON_SH=$_common
+            break
+        fi
+    done
+fi
+
+if [ -z "$COMMON_SH" ] || [ ! -r "$COMMON_SH" ]; then
+    echo "hnu-campus: cannot find common.sh" >&2
+    exit 1
+fi
+
+. "$COMMON_SH"
+
+CONFIG_FILE=${HNU_CAMPUS_CONFIG:-/etc/hnu-campus.conf}
+RUNTIME_DIR=${HNU_CAMPUS_RUNTIME:-/tmp/hnu-campus}
+STATE_FILE="$RUNTIME_DIR/state"
+COOLDOWN_FILE="$RUNTIME_DIR/retry-after"
+FORCE_STAMP="$RUNTIME_DIR/last-force"
+LAST_SUCCESS_FILE="$RUNTIME_DIR/last-success"
+LOCK_FILE="$RUNTIME_DIR/lock"
+DISABLE_FILE=${HNU_CAMPUS_DISABLE:-/etc/hnu-campus.disabled}
+LOG_TAG='hnu-campus'
+CONFIG_MISSING=0
+CONFIG_ERROR=''
+
+ENABLED=1
+USERNAME=''
+PASSWORD=''
+ACCOUNT_PREFIX=',1,'
+ISP_SUFFIX=''
+PORTAL_SCHEME='http'
+PORTAL_HOST='10.2.68.30'
+PORTAL_PORT='801'
+PORTAL_LOGIN_PATH='/eportal/portal/login'
+PORTAL_LOGOUT_PATH='/eportal/portal/logout'
+REFERER='http://10.2.68.30/'
+WAN_IF='wan'
+WAN_IP=''
+USER_MAC='000000000000'
+AC_IP=''
+AC_NAME=''
+LOGIN_METHOD='1'
+TERMINAL_TYPE='2'
+JS_VERSION='4.2.1'
+VERSION_PARAM='2012'
+CALLBACK='dr1003'
+CHECK_INTERVAL=60
+OFFLINE_CONFIRM=2
+RETRY_BASE=30
+RETRY_MAX=600
+AUTH_COOLDOWN=1800
+LIMIT_COOLDOWN=600
+BLOCKED_COOLDOWN=1800
+FORCE_RELOGIN_HOURS=6
+HTTP_TIMEOUT=10
+HTTP_CONNECT_TIMEOUT=5
+CHECK_URLS='http://connect.rom.miui.com/generate_204 http://connectivitycheck.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt http://www.msftconnecttest.com/connecttest.txt http://captive.apple.com/hotspot-detect.html'
+LOG_FILE='/etc/hnu-campus.log'
+LOG_MAX_KB=256
+UA='Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36 EdgA/138.0.0.0'
+
+ACTION=check
+VERBOSE=0
+QUIET=0
+FORCE=0
+HTTP_CLIENT=''
+WGET_HAS_HEADER=0
+LOCK_HELD=0
+
+usage() {
+    cat <<'EOF'
+Usage: hnu-campus [command] [options]
+
+Commands:
+  check       probe once; log in when offline or the safety re-login is due (default)
+  login       force one login attempt, bypassing the online probe and cooldown
+  logout      try to log out the current WAN IPv4 session
+  status      show service, link, session and recent log state
+  test        print the masked request without sending credentials
+  watch       run the procd watchdog loop
+  enable      resume automatic login
+  disable     pause automatic login without logging out
+
+Options:
+  -c, --config FILE   use an alternate config file
+  -v, --verbose       print details to stderr
+  -q, --quiet         suppress verbose log output
+  -f, --force         force login (same as the login command)
+  -h, --help          show this help
+EOF
+}
+
+die() {
+    printf 'hnu-campus: %s\n' "$*" >&2
+    log "ERROR: $*"
+    exit 1
+}
+
+now_epoch() {
+    date +%s 2>/dev/null || echo 0
+}
+
+rotate_log() {
+    [ -n "$LOG_FILE" ] || return 0
+    [ -f "$LOG_FILE" ] || return 0
+    case "$LOG_MAX_KB" in
+        ''|*[!0-9]*)
+            return 0
+            ;;
+    esac
+    _rl_size=$( ( wc -c < "$LOG_FILE" ) 2>/dev/null | awk '{print $1 + 0}')
+    [ -n "$_rl_size" ] || return 0
+    [ "$_rl_size" -gt $((LOG_MAX_KB * 1024)) ] 2>/dev/null || return 0
+    ( tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" ) 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
+}
+
+log() {
+    _log_ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '-')
+    _log_msg="$*"
+
+    if [ -n "$LOG_FILE" ]; then
+        ( printf '%s %s\n' "$_log_ts" "$_log_msg" >> "$LOG_FILE" ) 2>/dev/null || true
+        rotate_log
+    fi
+
+    if command -v logger >/dev/null 2>&1; then
+        logger -t "$LOG_TAG" "$_log_msg" 2>/dev/null || true
+    fi
+
+    if [ "$VERBOSE" = 1 ] && [ "$QUIET" = 0 ]; then
+        printf '[%s] %s\n' "$LOG_TAG" "$_log_msg" >&2
+    fi
+
+    return 0
+}
+
+read_stamp() {
+    _rs_value=$(cat "$1" 2>/dev/null || echo 0)
+    case "$_rs_value" in
+        ''|*[!0-9]*)
+            echo 0
+            ;;
+        *)
+            echo "$_rs_value"
+            ;;
+    esac
+}
+
+write_stamp() {
+    printf '%s\n' "$2" > "$1" 2>/dev/null || true
+}
+
+format_time() {
+    _ft_value=${1:-0}
+    if [ "$_ft_value" = 0 ]; then
+        echo '无'
+        return 0
+    fi
+    if date -d "@$_ft_value" '+%Y-%m-%d %H:%M:%S' >/dev/null 2>&1; then
+        date -d "@$_ft_value" '+%Y-%m-%d %H:%M:%S'
+    elif date -r "$_ft_value" '+%Y-%m-%d %H:%M:%S' >/dev/null 2>&1; then
+        date -r "$_ft_value" '+%Y-%m-%d %H:%M:%S'
+    else
+        echo "$_ft_value"
+    fi
+}
+
+load_config() {
+    CONFIG_MISSING=0
+    CONFIG_ERROR=''
+
+    if [ -r "$CONFIG_FILE" ]; then
+        if ! sh -n "$CONFIG_FILE" >/dev/null 2>&1; then
+            CONFIG_ERROR="配置文件语法错误: $CONFIG_FILE"
+            return 1
+        fi
+        . "$CONFIG_FILE"
+        return 0
+    fi
+
+    CONFIG_MISSING=1
+    CONFIG_ERROR="找不到配置文件: $CONFIG_FILE"
+    return 1
+}
+
+check_config_permissions() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    _ccp_mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || echo '')
+    case "$_ccp_mode" in
+        ''|400|600)
+            ;;
+        *)
+            log "WARN: 配置文件权限为 $_ccp_mode，建议执行 chmod 600 $CONFIG_FILE"
+            ;;
+    esac
+}
+
+detect_http_client() {
+    if command -v curl >/dev/null 2>&1; then
+        HTTP_CLIENT=curl
+    elif command -v wget >/dev/null 2>&1; then
+        HTTP_CLIENT=wget
+        if wget --help 2>&1 | grep -q -- '--header'; then
+            WGET_HAS_HEADER=1
+        fi
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        HTTP_CLIENT=uclient-fetch
+    else
+        HTTP_CLIENT=''
+    fi
+}
+
+http_get() {
+    _hg_url=$1
+    _hg_ref=${2-$REFERER}
+
+    case "$HTTP_CLIENT" in
+        curl)
+            if [ -n "$_hg_ref" ]; then
+                curl -q -sS -L --max-redirs 3 --max-time "$HTTP_TIMEOUT" \
+                    --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+                    -A "$UA" -e "$_hg_ref" \
+                    -H 'Accept: */*' \
+                    -H 'Accept-Language: zh-CN,zh;q=0.9' \
+                    "$_hg_url" 2>/dev/null
+            else
+                curl -q -sS -L --max-redirs 3 --max-time "$HTTP_TIMEOUT" \
+                    --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+                    -A "$UA" \
+                    -H 'Accept: */*' \
+                    -H 'Accept-Language: zh-CN,zh;q=0.9' \
+                    "$_hg_url" 2>/dev/null
+            fi
+            ;;
+        wget)
+            if [ "$WGET_HAS_HEADER" = 1 ] && [ -n "$_hg_ref" ]; then
+                wget -q -O - -T "$HTTP_TIMEOUT" \
+                    --header="User-Agent: $UA" \
+                    --header="Referer: $_hg_ref" \
+                    --header="Accept: */*" \
+                    --header="Accept-Language: zh-CN,zh;q=0.9" \
+                    "$_hg_url" 2>/dev/null
+            elif [ "$WGET_HAS_HEADER" = 1 ]; then
+                wget -q -O - -T "$HTTP_TIMEOUT" \
+                    --header="User-Agent: $UA" \
+                    --header="Accept: */*" \
+                    --header="Accept-Language: zh-CN,zh;q=0.9" \
+                    "$_hg_url" 2>/dev/null
+            else
+                wget -q -O - -T "$HTTP_TIMEOUT" "$_hg_url" 2>/dev/null
+            fi
+            ;;
+        uclient-fetch)
+            if [ -n "$_hg_ref" ]; then
+                uclient-fetch -q -O - -T "$HTTP_TIMEOUT" \
+                    --header="User-Agent: $UA" \
+                    --header="Referer: $_hg_ref" \
+                    --header="Accept: */*" \
+                    --header="Accept-Language: zh-CN,zh;q=0.9" \
+                    "$_hg_url" 2>/dev/null
+            else
+                uclient-fetch -q -O - -T "$HTTP_TIMEOUT" \
+                    --header="User-Agent: $UA" \
+                    --header="Accept: */*" \
+                    --header="Accept-Language: zh-CN,zh;q=0.9" \
+                    "$_hg_url" 2>/dev/null
+            fi
+            ;;
+        *)
+            return 127
+            ;;
+    esac
+}
+
+require_uint() {
+    is_uint "$2" || die "$1 必须是非负整数（当前: $2）"
+}
+
+validate_config() {
+    if [ -n "$CONFIG_ERROR" ]; then
+        die "$CONFIG_ERROR"
+    fi
+
+    case "$ENABLED" in
+        0|1)
+            ;;
+        *)
+            die "ENABLED 只能是 0 或 1"
+            ;;
+    esac
+
+    [ -n "$USERNAME" ] || die "USERNAME 不能为空"
+    [ -n "$PASSWORD" ] || die "PASSWORD 不能为空"
+
+    case "$USERNAME" in
+        *'你的学号'*|*your-username*)
+            die "请先编辑 $CONFIG_FILE，填写 USERNAME"
+            ;;
+    esac
+
+    case "$PASSWORD" in
+        *'你的统一身份认证密码'*|*replace-with-your-password*|*your-password*)
+            die "请先编辑 $CONFIG_FILE，填写 PASSWORD"
+            ;;
+    esac
+
+    valid_host "$PORTAL_HOST" || die "PORTAL_HOST 格式不正确"
+    case "$PORTAL_SCHEME" in
+        http|https)
+            ;;
+        *)
+            die "PORTAL_SCHEME 只能是 http 或 https"
+            ;;
+    esac
+
+    if [ -n "$PORTAL_PORT" ]; then
+        is_uint "$PORTAL_PORT" || die "PORTAL_PORT 必须是整数"
+        [ "$PORTAL_PORT" -ge 1 ] && [ "$PORTAL_PORT" -le 65535 ] \
+            || die "PORTAL_PORT 必须在 1-65535 之间"
+    fi
+
+    case "$PORTAL_LOGIN_PATH" in
+        /*)
+            ;;
+        *)
+            die "PORTAL_LOGIN_PATH 必须以 / 开头"
+            ;;
+    esac
+
+    case "$PORTAL_LOGOUT_PATH" in
+        /*)
+            ;;
+        *)
+            die "PORTAL_LOGOUT_PATH 必须以 / 开头"
+            ;;
+    esac
+
+    [ -n "$CALLBACK" ] || die "CALLBACK 不能为空"
+    [ -n "$UA" ] || die "UA 不能为空"
+    [ -n "$LOGIN_METHOD" ] || die "LOGIN_METHOD 不能为空"
+    [ -n "$TERMINAL_TYPE" ] || die "TERMINAL_TYPE 不能为空"
+    [ -n "$JS_VERSION" ] || die "JS_VERSION 不能为空"
+    [ -n "$VERSION_PARAM" ] || die "VERSION_PARAM 不能为空"
+
+    valid_iface "$WAN_IF" || die "WAN_IF 格式不正确"
+    if [ -n "$WAN_IP" ]; then
+        valid_ipv4 "$WAN_IP" || die "WAN_IP 不是合法的 IPv4 地址"
+        case "$WAN_IP" in
+            0.0.0.0|127.*|169.254.*)
+                die "WAN_IP 不能是回环、链路本地或 0.0.0.0"
+                ;;
+        esac
+    fi
+
+    case "$USER_MAC" in
+        auto)
+            ;;
+        '')
+            USER_MAC='000000000000'
+            ;;
+        *)
+            _vc_mac=$(printf '%s' "$USER_MAC" | tr -d ':' | tr 'A-F' 'a-f')
+            case "$_vc_mac" in
+                *[!0-9a-f]*)
+                    die "USER_MAC 只能是 auto、12 位十六进制或留空"
+                    ;;
+            esac
+            [ ${#_vc_mac} -eq 12 ] || die "USER_MAC 必须是 12 位十六进制"
+            USER_MAC=$_vc_mac
+            ;;
+    esac
+
+    if [ -n "$AC_IP" ]; then
+        valid_ipv4 "$AC_IP" || die "AC_IP 不是合法的 IPv4 地址"
+    fi
+
+    require_uint CHECK_INTERVAL "$CHECK_INTERVAL"
+    require_uint OFFLINE_CONFIRM "$OFFLINE_CONFIRM"
+    require_uint RETRY_BASE "$RETRY_BASE"
+    require_uint RETRY_MAX "$RETRY_MAX"
+    require_uint AUTH_COOLDOWN "$AUTH_COOLDOWN"
+    require_uint LIMIT_COOLDOWN "$LIMIT_COOLDOWN"
+    require_uint BLOCKED_COOLDOWN "$BLOCKED_COOLDOWN"
+    require_uint FORCE_RELOGIN_HOURS "$FORCE_RELOGIN_HOURS"
+    require_uint HTTP_TIMEOUT "$HTTP_TIMEOUT"
+    require_uint HTTP_CONNECT_TIMEOUT "$HTTP_CONNECT_TIMEOUT"
+    require_uint LOG_MAX_KB "$LOG_MAX_KB"
+
+    [ "$CHECK_INTERVAL" -gt 0 ] || die "CHECK_INTERVAL 必须大于 0"
+    [ "$OFFLINE_CONFIRM" -gt 0 ] || die "OFFLINE_CONFIRM 必须大于 0"
+    [ "$RETRY_BASE" -gt 0 ] || die "RETRY_BASE 必须大于 0"
+    [ "$RETRY_MAX" -ge "$RETRY_BASE" ] || die "RETRY_MAX 不能小于 RETRY_BASE"
+    [ "$HTTP_TIMEOUT" -gt 0 ] || die "HTTP_TIMEOUT 必须大于 0"
+    [ "$HTTP_CONNECT_TIMEOUT" -gt 0 ] || die "HTTP_CONNECT_TIMEOUT 必须大于 0"
+    [ "$LOG_MAX_KB" -gt 0 ] || die "LOG_MAX_KB 必须大于 0"
+
+    [ -n "$CHECK_URLS" ] || die "CHECK_URLS 不能为空"
+    for _vc_url in $CHECK_URLS; do
+        case "$_vc_url" in
+            http://*|https://*)
+                ;;
+            *)
+                die "CHECK_URLS 中的地址必须以 http:// 或 https:// 开头: $_vc_url"
+                ;;
+        esac
+    done
+
+    [ -n "$HTTP_CLIENT" ] || die "找不到 curl、wget 或 uclient-fetch"
+    return 0
+}
+
+is_disabled() {
+    [ "${ENABLED:-1}" = 0 ] && return 0
+    [ -e "$DISABLE_FILE" ] && return 0
+    return 1
+}
+
+portal_base() {
+    if [ -n "$PORTAL_PORT" ]; then
+        printf '%s://%s:%s' "$PORTAL_SCHEME" "$PORTAL_HOST" "$PORTAL_PORT"
+    else
+        printf '%s://%s' "$PORTAL_SCHEME" "$PORTAL_HOST"
+    fi
+}
+
+build_query() {
+    _bq_ip=$1
+    _bq_mac=$2
+    _bq_account="${ACCOUNT_PREFIX}${USERNAME}${ISP_SUFFIX}"
+
+    printf 'callback=%s&login_method=%s&user_account=%s&user_password=%s&wlan_user_ip=%s&wlan_user_ipv6=&wlan_user_mac=%s&wlan_ac_ip=%s&wlan_ac_name=%s&jsVersion=%s&terminal_type=%s&lang=zh-cn&v=%s' \
+        "$(urlencode "$CALLBACK")" \
+        "$(urlencode "$LOGIN_METHOD")" \
+        "$(urlencode "$_bq_account")" \
+        "$(urlencode "$PASSWORD")" \
+        "$_bq_ip" \
+        "$_bq_mac" \
+        "$(urlencode "$AC_IP")" \
+        "$(urlencode "$AC_NAME")" \
+        "$(urlencode "$JS_VERSION")" \
+        "$(urlencode "$TERMINAL_TYPE")" \
+        "$(urlencode "$VERSION_PARAM")"
+}
+
+build_logout_query() {
+    _blq_ip=$1
+    _blq_mac=$2
+    _blq_account="${ACCOUNT_PREFIX}${USERNAME}${ISP_SUFFIX}"
+
+    printf 'callback=%s&login_method=%s&user_account=%s&user_password=%s&wlan_user_ip=%s&wlan_user_ipv6=&wlan_user_mac=%s&wlan_ac_ip=%s&wlan_ac_name=%s&jsVersion=%s&terminal_type=%s&lang=zh-cn&v=%s' \
+        "$(urlencode "$CALLBACK")" \
+        "$(urlencode "$LOGIN_METHOD")" \
+        "$(urlencode "$_blq_account")" \
+        "$(urlencode "$PASSWORD")" \
+        "$_blq_ip" \
+        "$_blq_mac" \
+        "$(urlencode "$AC_IP")" \
+        "$(urlencode "$AC_NAME")" \
+        "$(urlencode "$JS_VERSION")" \
+        "$(urlencode "$TERMINAL_TYPE")" \
+        "$(urlencode "$VERSION_PARAM")"
+}
+
+build_login_url() {
+    printf '%s%s?%s' "$(portal_base)" "$PORTAL_LOGIN_PATH" "$(build_query "$1" "$2")"
+}
+
+build_logout_url() {
+    printf '%s%s?%s' "$(portal_base)" "$PORTAL_LOGOUT_PATH" "$(build_logout_query "$1" "$2")"
+}
+
+get_wan_dev() {
+    _gwd_dev=''
+
+    if command -v ubus >/dev/null 2>&1; then
+        _gwd_dev=$(ubus call "network.interface.$WAN_IF" status 2>/dev/null \
+            | sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n 1)
+    fi
+
+    if [ -z "$_gwd_dev" ] && command -v ifstatus >/dev/null 2>&1; then
+        _gwd_dev=$(ifstatus "$WAN_IF" 2>/dev/null \
+            | sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n 1)
+    fi
+
+    if [ -z "$_gwd_dev" ] && command -v ip >/dev/null 2>&1; then
+        _gwd_dev=$(ip route show default 2>/dev/null \
+            | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+    fi
+
+    [ -n "$_gwd_dev" ] || _gwd_dev=$WAN_IF
+    printf '%s' "$_gwd_dev"
+}
+
+iface_ip() {
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -4 addr show dev "$1" 2>/dev/null \
+        | awk '/inet / { print $2; exit }' \
+        | cut -d/ -f1
+}
+
+get_wan_ip() {
+    if [ -n "$WAN_IP" ]; then
+        valid_ipv4 "$WAN_IP" || return 1
+        printf '%s' "$WAN_IP"
+        return 0
+    fi
+
+    _gwi_ip=''
+    if command -v ip >/dev/null 2>&1; then
+        _gwi_ip=$(ip -4 route get "$PORTAL_HOST" 2>/dev/null \
+            | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+    fi
+
+    case "$_gwi_ip" in
+        127.*|169.254.*|0.0.0.0)
+            _gwi_ip=''
+            ;;
+    esac
+
+    if valid_ipv4 "$_gwi_ip"; then
+        printf '%s' "$_gwi_ip"
+        return 0
+    fi
+
+    _gwi_dev=$(get_wan_dev)
+    _gwi_ip=$(iface_ip "$_gwi_dev")
+
+    if valid_ipv4 "$_gwi_ip"; then
+        printf '%s' "$_gwi_ip"
+        return 0
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        _gwi_dev=$(ip route show default 2>/dev/null \
+            | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+        if [ -n "$_gwi_dev" ]; then
+            _gwi_ip=$(iface_ip "$_gwi_dev")
+            if valid_ipv4 "$_gwi_ip"; then
+                printf '%s' "$_gwi_ip"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+get_wan_mac() {
+    if [ "$USER_MAC" != auto ]; then
+        _gwm_mac=$(printf '%s' "$USER_MAC" | tr -d ':' | tr 'A-F' 'a-f')
+        case "$_gwm_mac" in
+            *[!0-9a-f]*|'')
+                printf '%s' '000000000000'
+                ;;
+            *)
+                printf '%s' "$_gwm_mac"
+                ;;
+        esac
+        return 0
+    fi
+
+    _gwm_dev=$(get_wan_dev)
+    _gwm_mac=$(cat "/sys/class/net/$_gwm_dev/address" 2>/dev/null \
+        | tr -d ':' | tr 'A-F' 'a-f')
+
+    case "$_gwm_mac" in
+        *[!0-9a-f]*|'')
+            _gwm_mac='000000000000'
+            ;;
+    esac
+
+    printf '%s' "$_gwm_mac"
+}
+
+portal_reachable() {
+    _pr_body=$(http_get "$(portal_base)/eportal/")
+    if [ -n "$_pr_body" ]; then
+        return 0
+    fi
+
+    _pr_body=$(http_get "$(portal_base)/")
+    [ -n "$_pr_body" ]
+}
+
+probe_once() {
+    for _po_url in $CHECK_URLS; do
+        _po_body=$(http_get "$_po_url" "") || continue
+
+        case "$_po_url" in
+            *generate_204*)
+                [ -z "$_po_body" ] && return 0
+                ;;
+            *success.txt*)
+                _po_trim=$(printf '%s' "$_po_body" | tr -d '\r\n')
+                [ "$_po_trim" = 'success' ] && return 0
+                ;;
+            *connecttest.txt*)
+                printf '%s' "$_po_body" | grep -q 'Microsoft Connect Test' && return 0
+                ;;
+            *hotspot-detect.html*)
+                printf '%s' "$_po_body" | grep -q 'Success' && return 0
+                ;;
+            *)
+                [ -n "$_po_body" ] && return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+probe_online() {
+    case "$OFFLINE_CONFIRM" in
+        ''|*[!0-9]*)
+            _pon_limit=2
+            ;;
+        *)
+            _pon_limit=$OFFLINE_CONFIRM
+            ;;
+    esac
+    [ "$_pon_limit" -gt 0 ] || _pon_limit=1
+
+    _pon_i=1
+    while [ "$_pon_i" -le "$_pon_limit" ]; do
+        probe_once && return 0
+        _pon_i=$((_pon_i + 1))
+        [ "$_pon_i" -le "$_pon_limit" ] && sleep 3
+    done
+    return 1
+}
+
+set_state() {
+    _ss_new=$1
+    _ss_old=$(cat "$STATE_FILE" 2>/dev/null || echo unknown)
+
+    [ "$_ss_old" = "$_ss_new" ] && return 0
+
+    printf '%s\n' "$_ss_new" > "$STATE_FILE" 2>/dev/null || true
+    log "状态: ${_ss_old} -> ${_ss_new}"
+}
+
+set_cooldown() {
+    _sc_seconds=$1
+    [ "$_sc_seconds" -gt 0 ] || return 0
+    _sc_until=$(( $(now_epoch) + _sc_seconds ))
+    write_stamp "$COOLDOWN_FILE" "$_sc_until"
+}
+
+clear_cooldown() {
+    rm -f "$COOLDOWN_FILE" 2>/dev/null || true
+}
+
+cooldown_remaining() {
+    _cr_until=$(read_stamp "$COOLDOWN_FILE")
+    [ "$_cr_until" -gt 0 ] || { echo 0; return 0; }
+
+    _cr_now=$(now_epoch)
+    if [ "$_cr_until" -le "$_cr_now" ]; then
+        echo 0
+        return 0
+    fi
+
+    _cr_rem=$((_cr_until - _cr_now))
+    [ "$_cr_rem" -gt 86400 ] && _cr_rem=86400
+    echo "$_cr_rem"
+}
+
+record_success() {
+    set_state online
+    write_stamp "$LAST_SUCCESS_FILE" "$(now_epoch)"
+    clear_cooldown
+}
+
+do_login() {
+    _dl_ip=$(get_wan_ip) || {
+        log "无法获取 WAN IPv4（WAN 是否已经 DHCP 成功？）"
+        return 1
+    }
+
+    _dl_mac=$(get_wan_mac)
+
+    if ! portal_reachable; then
+        log "门户不可达: $(portal_base)"
+        return 1
+    fi
+
+    _dl_url=$(build_login_url "$_dl_ip" "$_dl_mac")
+    [ "$VERBOSE" = 1 ] && log "登录请求: $(mask_password_url "$_dl_url")"
+
+    _dl_resp=$(http_get "$_dl_url")
+    _dl_rc=$?
+
+    if [ "$_dl_rc" -ne 0 ] || [ -z "$_dl_resp" ]; then
+        log "认证请求失败（HTTP 客户端退出码 $_dl_rc，IP=$_dl_ip）"
+        return 1
+    fi
+
+    _dl_kind=$(classify_response "$_dl_resp")
+    _dl_msg=$(json_get_string "$(jsonp_payload "$_dl_resp")" msg)
+
+    case "$_dl_kind" in
+        success)
+            record_success
+            log "认证成功（IP=$_dl_ip${_dl_msg:+，$_dl_msg}）"
+            return 0
+            ;;
+        online)
+            record_success
+            log "已经在线（IP=$_dl_ip${_dl_msg:+，$_dl_msg}）"
+            return 0
+            ;;
+        credentials)
+            set_cooldown "$AUTH_COOLDOWN"
+            log "认证被拒：学号或密码错误${_dl_msg:+（$_dl_msg）}"
+            return 3
+            ;;
+        limited)
+            set_cooldown "$LIMIT_COOLDOWN"
+            log "认证受限：疑似设备数或 MAC 绑定限制${_dl_msg:+（$_dl_msg）}"
+            return 4
+            ;;
+        blocked)
+            set_cooldown "$BLOCKED_COOLDOWN"
+            log "认证受限：账号可能被暂停、欠费或不在允许时段${_dl_msg:+（$_dl_msg）}"
+            return 5
+            ;;
+        config)
+            set_cooldown "$RETRY_MAX"
+            log "门户接口异常，请检查 PORTAL_HOST/PORTAL_PORT/PORTAL_LOGIN_PATH${_dl_msg:+（$_dl_msg）}"
+            return 6
+            ;;
+        transient)
+            log "门户暂时不可用${_dl_msg:+（$_dl_msg）}"
+            return 1
+            ;;
+        *)
+            log "未识别的认证响应: $(printf '%s' "$_dl_resp" | head -c 300)"
+            return 1
+            ;;
+    esac
+}
+
+do_logout() {
+    validate_config
+
+    _dlo_ip=$(get_wan_ip) || {
+        log "无法获取 WAN IPv4"
+        return 1
+    }
+
+    _dlo_mac=$(get_wan_mac)
+
+    if ! portal_reachable; then
+        log "门户不可达: $(portal_base)"
+        return 1
+    fi
+
+    _dlo_url=$(build_logout_url "$_dlo_ip" "$_dlo_mac")
+    [ "$VERBOSE" = 1 ] && log "注销请求: $(mask_password_url "$_dlo_url")"
+
+    _dlo_resp=$(http_get "$_dlo_url")
+    _dlo_rc=$?
+
+    if [ "$_dlo_rc" -ne 0 ] || [ -z "$_dlo_resp" ]; then
+        log "注销请求失败（HTTP 客户端退出码 $_dlo_rc）"
+        return 1
+    fi
+
+    _dlo_kind=$(classify_response "$_dlo_resp")
+    _dlo_msg=$(json_get_string "$(jsonp_payload "$_dlo_resp")" msg)
+
+    case "$_dlo_resp" in
+        *未在线*|*不在线*|*未登录*|*已注销*|*注销成功*)
+            _dlo_kind=success
+            ;;
+    esac
+
+    if [ "$_dlo_kind" = success ]; then
+        set_state offline
+        rm -f "$LAST_SUCCESS_FILE" "$FORCE_STAMP" 2>/dev/null || true
+        clear_cooldown
+        log "注销成功（IP=$_dlo_ip${_dlo_msg:+，$_dlo_msg}）"
+        printf '注销成功\n'
+        if ! is_disabled; then
+            printf '注意：自动认证仍启用，下一次巡检可能重新登录；临时换设备请先执行 disable。\n'
+        fi
+        return 0
+    fi
+
+    log "注销失败${_dlo_msg:+：$_dlo_msg}"
+    printf '注销失败%s\n' "${_dlo_msg:+：$_dlo_msg}"
+    return 1
+}
+
+check_once() {
+    if is_disabled; then
+        if [ "$FORCE" = 1 ]; then
+            log "自动认证已停用；请先执行 hnu-campus enable"
+            return 2
+        fi
+        return 0
+    fi
+
+    validate_config
+
+    _co_remaining=$(cooldown_remaining)
+    if [ "$FORCE" != 1 ] && [ "$_co_remaining" -gt 0 ]; then
+        [ "$VERBOSE" = 1 ] && log "冷却中，剩余 ${_co_remaining}s"
+        return 1
+    fi
+
+    _co_now=$(now_epoch)
+    _co_force_due=0
+
+    if [ "$FORCE_RELOGIN_HOURS" -gt 0 ]; then
+        _co_last=$(read_stamp "$FORCE_STAMP")
+        if [ "$_co_last" -eq 0 ] || [ $((_co_now - _co_last)) -ge $((FORCE_RELOGIN_HOURS * 3600)) ]; then
+            _co_force_due=1
+        fi
+    fi
+
+    if [ "$FORCE" = 1 ] || [ "$_co_force_due" = 1 ]; then
+        if [ "$_co_force_due" = 1 ] && [ "$FORCE" != 1 ]; then
+            log "触发兜底认证（首次运行，或距上次超过 ${FORCE_RELOGIN_HOURS} 小时）"
+        fi
+
+        do_login
+        _co_rc=$?
+        write_stamp "$FORCE_STAMP" "$_co_now"
+
+        if [ "$_co_rc" -eq 0 ]; then
+            return 0
+        fi
+
+        if [ "$FORCE" = 1 ]; then
+            return "$_co_rc"
+        fi
+
+        if probe_online; then
+            set_state online
+            return 0
+        fi
+
+        set_state offline
+        return "$_co_rc"
+    fi
+
+    if probe_online; then
+        set_state online
+        return 0
+    fi
+
+    set_state offline
+    do_login
+    _co_rc=$?
+
+    if [ "$_co_rc" -eq 0 ]; then
+        write_stamp "$FORCE_STAMP" "$(now_epoch)"
+    fi
+
+    return "$_co_rc"
+}
+
+acquire_lock() {
+    _al_wait=${1:-0}
+    _al_waited=0
+
+    while :; do
+        if ( set -C; printf '%s\n' "$$" > "$LOCK_FILE" ) 2>/dev/null; then
+            LOCK_HELD=1
+            return 0
+        fi
+
+        _al_old=$(cat "$LOCK_FILE" 2>/dev/null)
+        case "$_al_old" in
+            ''|*[!0-9]*)
+                rm -f "$LOCK_FILE" 2>/dev/null || true
+                continue
+                ;;
+        esac
+
+        if ! kill -0 "$_al_old" 2>/dev/null; then
+            rm -f "$LOCK_FILE" 2>/dev/null || true
+            continue
+        fi
+
+        [ "$_al_waited" -lt "$_al_wait" ] || return 1
+        sleep 1
+        _al_waited=$((_al_waited + 1))
+    done
+}
+
+release_lock() {
+    [ "$LOCK_HELD" = 1 ] && rm -f "$LOCK_FILE" 2>/dev/null || true
+    LOCK_HELD=0
+}
+
+service_state() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f 'hnu-campus watch' >/dev/null 2>&1 && { echo running; return 0; }
+    fi
+
+    if ps 2>/dev/null | grep -q '[h]nu-campus watch'; then
+        echo running
+        return 0
+    fi
+
+    echo stopped
+}
+
+do_status() {
+    printf '配置文件: %s\n' "$CONFIG_FILE"
+    [ -n "$CONFIG_ERROR" ] && printf '配置状态: %s\n' "$CONFIG_ERROR"
+    printf '服务: %s\n' "$(service_state)"
+
+    if [ "${ENABLED:-1}" = 0 ]; then
+        printf '自动认证: 已停用（ENABLED=0）\n'
+    elif [ -e "$DISABLE_FILE" ]; then
+        printf '自动认证: 已暂停（disable）\n'
+    else
+        printf '自动认证: 已启用\n'
+    fi
+
+    printf 'HTTP 客户端: %s\n' "${HTTP_CLIENT:-无}"
+    printf 'WAN 接口: %s\n' "$WAN_IF"
+
+    _ds_ip=$(get_wan_ip 2>/dev/null || true)
+    printf 'WAN IP: %s\n' "${_ds_ip:-未获取}"
+    printf '门户: %s\n' "$(portal_base)"
+    printf '账号: %s\n' "$(mask_account "$USERNAME")"
+
+    if [ -n "$CONFIG_ERROR" ]; then
+        printf '在线探测: 跳过（配置错误）\n'
+    elif [ "${HNU_CAMPUS_NO_NETWORK:-0}" = 1 ]; then
+        printf '在线探测: 跳过\n'
+    elif probe_online; then
+        printf '在线探测: 在线\n'
+    else
+        printf '在线探测: 离线\n'
+    fi
+
+    printf '状态文件: %s\n' "$(cat "$STATE_FILE" 2>/dev/null || echo unknown)"
+    printf '上次成功: %s\n' "$(format_time "$(read_stamp "$LAST_SUCCESS_FILE")")"
+
+    _ds_cooldown=$(cooldown_remaining)
+    [ "$_ds_cooldown" -gt 0 ] && printf '冷却剩余: %ss\n' "$_ds_cooldown"
+
+    printf '最近日志:\n'
+    if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
+        tail -n 10 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' || printf '  无\n'
+    else
+        printf '  无\n'
+    fi
+}
+
+do_test() {
+    validate_config
+
+    _dt_ip=$(get_wan_ip 2>/dev/null || true)
+    _dt_mac=$(get_wan_mac)
+    _dt_url=$(build_login_url "$_dt_ip" "$_dt_mac")
+
+    printf '配置文件: %s\n' "$CONFIG_FILE"
+    printf '门户: %s\n' "$(portal_base)"
+    printf '账号: %s\n' "${ACCOUNT_PREFIX}${USERNAME}${ISP_SUFFIX}"
+    printf 'WAN 接口: %s\n' "$WAN_IF"
+    printf 'WAN IP: %s\n' "${_dt_ip:-未获取}"
+    printf 'MAC: %s\n' "$_dt_mac"
+    printf '请求: %s\n' "$(mask_password_url "$_dt_url")"
+
+    if [ "${HNU_CAMPUS_NO_NETWORK:-0}" = 1 ]; then
+        printf '门户可达: 跳过\n'
+    elif portal_reachable; then
+        printf '门户可达: 是\n'
+    else
+        printf '门户可达: 否\n'
+    fi
+}
+
+do_disable() {
+    if : > "$DISABLE_FILE" 2>/dev/null; then
+        log "自动认证已暂停（未注销当前会话）"
+        printf '已暂停自动认证；当前会话未注销。\n'
+        return 0
+    fi
+
+    die "无法写入 $DISABLE_FILE"
+}
+
+do_enable() {
+    if ! rm -f "$DISABLE_FILE" 2>/dev/null; then
+        die "无法删除 $DISABLE_FILE"
+    fi
+    clear_cooldown
+    log "自动认证已恢复"
+    printf '已恢复自动认证。\n'
+
+    if [ "${ENABLED:-1}" = 0 ]; then
+        printf '注意：配置中 ENABLED=0，仍需改为 1 并重启服务。\n'
+        return 1
+    fi
+
+    if acquire_lock 5; then
+        check_once
+        _de_rc=$?
+        release_lock
+        return "$_de_rc"
+    fi
+
+    printf '另一个认证任务正在运行，稍后会自动检查。\n'
+    return 0
+}
+
+watch_loop() {
+    trap 'log "巡检退出"; exit 0' TERM INT HUP
+
+    case "$CHECK_INTERVAL" in
+        ''|*[!0-9]*|0)
+            _wl_check=60
+            ;;
+        *)
+            _wl_check=$CHECK_INTERVAL
+            ;;
+    esac
+
+    case "$RETRY_BASE" in
+        ''|*[!0-9]*|0)
+            _wl_retry_base=30
+            ;;
+        *)
+            _wl_retry_base=$RETRY_BASE
+            ;;
+    esac
+
+    case "$RETRY_MAX" in
+        ''|*[!0-9]*|0)
+            _wl_retry_max=600
+            ;;
+        *)
+            _wl_retry_max=$RETRY_MAX
+            ;;
+    esac
+
+    [ "$_wl_retry_max" -ge "$_wl_retry_base" ] || _wl_retry_max=$_wl_retry_base
+
+    if ! is_disabled; then
+        if ! ( validate_config ) >/dev/null 2>&1; then
+            log "配置无效，自动认证暂不启动；修复配置后请执行 /etc/init.d/hnu-campus restart"
+            while :; do
+                sleep 60
+                load_config
+                detect_http_client
+                if ( validate_config ) >/dev/null 2>&1; then
+                    log "配置已恢复，继续巡检"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    log "巡检启动：检查间隔 ${_wl_check}s"
+    _wl_fail=0
+
+    while :; do
+        _wl_remaining=$(cooldown_remaining)
+        if [ "$_wl_remaining" -gt 0 ]; then
+            sleep "$_wl_remaining"
+            continue
+        fi
+
+        if ! acquire_lock 0; then
+            sleep 5
+            continue
+        fi
+
+        check_once
+        _wl_rc=$?
+        release_lock
+
+        case "$_wl_rc" in
+            0)
+                _wl_fail=0
+                sleep "$_wl_check"
+                ;;
+            3|4|5|6)
+                _wl_fail=0
+                _wl_remaining=$(cooldown_remaining)
+                if [ "$_wl_remaining" -gt 0 ]; then
+                    sleep "$_wl_remaining"
+                else
+                    sleep "$_wl_retry_max"
+                fi
+                ;;
+            *)
+                _wl_fail=$((_wl_fail + 1))
+                if [ "$_wl_fail" -ge 8 ]; then
+                    _wl_sleep=$_wl_retry_max
+                else
+                    _wl_sleep=$((_wl_retry_base * (1 << (_wl_fail - 1))))
+                fi
+                [ "$_wl_sleep" -gt "$_wl_retry_max" ] && _wl_sleep=$_wl_retry_max
+                sleep "$_wl_sleep"
+                ;;
+        esac
+    done
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        check|login|logout|status|test|watch|enable|disable)
+            ACTION=$1
+            ;;
+        -c|--config)
+            [ $# -ge 2 ] || die "选项 $1 需要一个参数"
+            CONFIG_FILE=$2
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            ;;
+        -q|--quiet)
+            QUIET=1
+            ;;
+        -f|--force)
+            FORCE=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'hnu-campus: 未知参数 %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+case "$ACTION" in
+    check|login)
+        ;;
+    *)
+        FORCE=0
+        ;;
+esac
+
+mkdir -p "$RUNTIME_DIR" 2>/dev/null || die "无法创建运行时目录 $RUNTIME_DIR"
+load_config
+check_config_permissions
+detect_http_client
+
+case "$ACTION" in
+    check)
+        if ! acquire_lock 0; then
+            [ "$VERBOSE" = 1 ] && printf '另一个认证任务正在运行\n' >&2
+            exit 0
+        fi
+        check_once
+        _main_rc=$?
+        release_lock
+        exit "$_main_rc"
+        ;;
+    login)
+        FORCE=1
+        if ! acquire_lock 5; then
+            die "另一个认证任务正在运行，请稍后重试"
+        fi
+        check_once
+        _main_rc=$?
+        release_lock
+        exit "$_main_rc"
+        ;;
+    logout)
+        if ! acquire_lock 5; then
+            die "另一个认证任务正在运行，请稍后重试"
+        fi
+        do_logout
+        _main_rc=$?
+        release_lock
+        exit "$_main_rc"
+        ;;
+    status)
+        do_status
+        ;;
+    test)
+        do_test
+        ;;
+    watch)
+        watch_loop
+        ;;
+    enable)
+        do_enable
+        _main_rc=$?
+        exit "$_main_rc"
+        ;;
+    disable)
+        do_disable
+        ;;
+esac
