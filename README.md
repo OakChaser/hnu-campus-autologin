@@ -22,8 +22,6 @@
 电脑 / 手机 -> OpenWrt LAN 或 WiFi
 ```
 
-不要在路由器和另一台设备上同时用同一个账号分别登录；如果学校限制单会话，两边可能互相挤下线。
-
 脚本优先使用 `curl`，没有 `curl` 时自动使用 OpenWrt 自带的 `wget` / `uclient-fetch`。
 
 ## 特性
@@ -140,14 +138,14 @@ logread | grep hnu-campus
 
 常用命令：
 
-```text
-hnu-campus check        检查一次，离线或到达兜底时间时登录
-hnu-campus login        强制登录一次
-hnu-campus logout       尝试注销当前 WAN IP 的会话
-hnu-campus status       查看服务、在线状态、WAN IP 和最近日志
-hnu-campus test         打印脱敏请求，不发送
-hnu-campus enable       恢复自动认证
-hnu-campus disable      暂停自动认证，不注销当前会话
+```sh
+hnu-campus check        # 检查一次，离线或到达兜底时间时登录
+hnu-campus login        # 强制登录一次
+hnu-campus logout       # 尝试注销当前 WAN IP 的会话
+hnu-campus status       # 查看服务、在线状态、WAN IP 和最近日志
+hnu-campus test         # 打印脱敏请求，不发送
+hnu-campus enable       # 恢复自动认证
+hnu-campus disable      # 暂停自动认证，不注销当前会话
 ```
 
 临时换设备时：
@@ -309,7 +307,6 @@ sh /tmp/hnu-campus-autologin/uninstall.sh --purge
 - 路由器必须直接接校园网 WAN；如果路由器后面还有一层 NAT，`wlan_user_ip` 会不匹配。
 - 学校修改门户地址、参数或认证协议后，脚本可能需要同步调整配置。
 - 首次运行或每 `FORCE_RELOGIN_HOURS` 小时会做一次兜底认证。门户已在线时通常返回“已经在线”，不会重复建立会话。
-- 本项目不保证学校的多设备检测策略，也不提供规避手段。
 
 ## 开发与测试
 
@@ -335,10 +332,6 @@ sh tests/smoke.sh
 hnu-campus test
 hnu-campus check -v
 ```
-
-## 致谢
-
-认证参数参考了社区公开的湖南大学门户登录记录。项目本身与学校、Dr.COM 无隶属关系。
 
 ## License
 
