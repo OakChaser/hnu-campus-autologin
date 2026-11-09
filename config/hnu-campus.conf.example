@@ -22,8 +22,9 @@ PORTAL_LOGIN_PATH='/eportal/portal/login'
 PORTAL_LOGOUT_PATH='/eportal/portal/logout'
 REFERER='http://10.2.68.30/'
 
-# OpenWrt logical WAN interface. The script also auto-detects the source IP.
-WAN_IF='wan'
+# Campus uplink interface. Leave empty to auto-detect from the route to the
+# portal. Set it explicitly (for example eth0) when several uplinks are active.
+WAN_IF=''
 # Leave empty to auto-detect. Set a fixed IPv4 only if auto-detection is wrong.
 WAN_IP=''
 # 000000000000 matches the portal request used by HNU. "auto" uses the WAN MAC.
@@ -57,7 +58,7 @@ HTTP_CONNECT_TIMEOUT='5'
 CHECK_URLS='http://connect.rom.miui.com/generate_204 http://connectivitycheck.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt http://www.msftconnecttest.com/connecttest.txt http://captive.apple.com/hotspot-detect.html'
 
 # Persistent log. Syslog is also written when logger is available.
-LOG_FILE='/etc/hnu-campus.log'
+LOG_FILE='/var/log/hnu-campus.log'
 LOG_MAX_KB='256'
 
 # Mobile Edge user agent used by the web portal.

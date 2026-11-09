@@ -3,8 +3,8 @@
 set -u
 
 ROOT=$(CDPATH= cd "$(dirname "$0")/.." 2>/dev/null && pwd)
-COMMON="$ROOT/files/usr/share/hnu-campus/common.sh"
-MAIN="$ROOT/files/usr/sbin/hnu-campus"
+COMMON="$ROOT/files/usr/local/share/hnu-campus/common.sh"
+MAIN="$ROOT/files/usr/local/sbin/hnu-campus"
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/hnu-campus-test.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' 0 1 2 15
@@ -171,7 +171,7 @@ ACCOUNT_PREFIX=',1,'
 ISP_SUFFIX=''
 PORTAL_HOST='10.2.68.30'
 PORTAL_PORT='801'
-WAN_IF='wan'
+WAN_IF='eth0'
 WAN_IP='10.68.1.23'
 USER_MAC='000000000000'
 CHECK_INTERVAL='1'

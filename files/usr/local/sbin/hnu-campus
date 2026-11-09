@@ -3,8 +3,8 @@
 set -u
 umask 077
 
-PATH=${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
-for _path_dir in /usr/sbin /usr/bin /sbin /bin; do
+PATH=${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
+for _path_dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
     case ":$PATH:" in
         *":$_path_dir:"*)
             ;;
@@ -22,7 +22,7 @@ COMMON_SH=${HNU_CAMPUS_COMMON:-}
 
 if [ -z "$COMMON_SH" ]; then
     for _common in \
-        /usr/share/hnu-campus/common.sh \
+        /usr/local/share/hnu-campus/common.sh \
         "$SELF_DIR/../share/hnu-campus/common.sh" \
         "$SELF_DIR/common.sh"
     do
@@ -41,7 +41,7 @@ fi
 . "$COMMON_SH"
 
 CONFIG_FILE=${HNU_CAMPUS_CONFIG:-/etc/hnu-campus.conf}
-RUNTIME_DIR=${HNU_CAMPUS_RUNTIME:-/tmp/hnu-campus}
+RUNTIME_DIR=${HNU_CAMPUS_RUNTIME:-/run/hnu-campus}
 STATE_FILE="$RUNTIME_DIR/state"
 COOLDOWN_FILE="$RUNTIME_DIR/retry-after"
 FORCE_STAMP="$RUNTIME_DIR/last-force"
@@ -63,7 +63,7 @@ PORTAL_PORT='801'
 PORTAL_LOGIN_PATH='/eportal/portal/login'
 PORTAL_LOGOUT_PATH='/eportal/portal/logout'
 REFERER='http://10.2.68.30/'
-WAN_IF='wan'
+WAN_IF=''
 WAN_IP=''
 USER_MAC='000000000000'
 AC_IP=''
@@ -84,7 +84,7 @@ FORCE_RELOGIN_HOURS=6
 HTTP_TIMEOUT=10
 HTTP_CONNECT_TIMEOUT=5
 CHECK_URLS='http://connect.rom.miui.com/generate_204 http://connectivitycheck.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt http://www.msftconnecttest.com/connecttest.txt http://captive.apple.com/hotspot-detect.html'
-LOG_FILE='/etc/hnu-campus.log'
+LOG_FILE='/var/log/hnu-campus.log'
 LOG_MAX_KB=256
 UA='Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36 EdgA/138.0.0.0'
 
@@ -106,7 +106,7 @@ Commands:
   logout      try to log out the current WAN IPv4 session
   status      show service, link, session and recent log state
   test        print the masked request without sending credentials
-  watch       run the procd watchdog loop
+  watch       run the background watchdog loop (used by systemd)
   enable      resume automatic login
   disable     pause automatic login without logging out
 
@@ -372,7 +372,9 @@ validate_config() {
     [ -n "$JS_VERSION" ] || die "JS_VERSION 不能为空"
     [ -n "$VERSION_PARAM" ] || die "VERSION_PARAM 不能为空"
 
-    valid_iface "$WAN_IF" || die "WAN_IF 格式不正确"
+    if [ -n "$WAN_IF" ]; then
+        valid_iface "$WAN_IF" || die "WAN_IF 格式不正确"
+    fi
     if [ -n "$WAN_IP" ]; then
         valid_ipv4 "$WAN_IP" || die "WAN_IP 不是合法的 IPv4 地址"
         case "$WAN_IP" in
@@ -500,18 +502,16 @@ build_logout_url() {
 }
 
 get_wan_dev() {
-    _gwd_dev=''
-
-    if command -v ubus >/dev/null 2>&1; then
-        _gwd_dev=$(ubus call "network.interface.$WAN_IF" status 2>/dev/null \
-            | sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            | head -n 1)
+    if [ -n "$WAN_IF" ]; then
+        printf '%s' "$WAN_IF"
+        return 0
     fi
 
-    if [ -z "$_gwd_dev" ] && command -v ifstatus >/dev/null 2>&1; then
-        _gwd_dev=$(ifstatus "$WAN_IF" 2>/dev/null \
-            | sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            | head -n 1)
+    _gwd_dev=''
+
+    if command -v ip >/dev/null 2>&1; then
+        _gwd_dev=$(ip route get "$PORTAL_HOST" 2>/dev/null \
+            | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
     fi
 
     if [ -z "$_gwd_dev" ] && command -v ip >/dev/null 2>&1; then
@@ -519,7 +519,6 @@ get_wan_dev() {
             | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
     fi
 
-    [ -n "$_gwd_dev" ] || _gwd_dev=$WAN_IF
     printf '%s' "$_gwd_dev"
 }
 
@@ -928,6 +927,16 @@ release_lock() {
 }
 
 service_state() {
+    if command -v systemctl >/dev/null 2>&1; then
+        _ss_state=$(systemctl is-active hnu-campus.service 2>/dev/null || true)
+        case "$_ss_state" in
+            active|activating|deactivating|failed|inactive)
+                printf '%s' "$_ss_state"
+                return 0
+                ;;
+        esac
+    fi
+
     if command -v pgrep >/dev/null 2>&1; then
         pgrep -f 'hnu-campus watch' >/dev/null 2>&1 && { echo running; return 0; }
     fi
@@ -944,6 +953,14 @@ do_status() {
     printf '配置文件: %s\n' "$CONFIG_FILE"
     [ -n "$CONFIG_ERROR" ] && printf '配置状态: %s\n' "$CONFIG_ERROR"
     printf '服务: %s\n' "$(service_state)"
+    if command -v systemctl >/dev/null 2>&1; then
+        _ds_enabled=$(systemctl is-enabled hnu-campus.service 2>/dev/null || true)
+        case "$_ds_enabled" in
+            enabled|disabled|static|masked|indirect|generated|alias)
+                printf '开机自启: %s\n' "$_ds_enabled"
+                ;;
+        esac
+    fi
 
     if [ "${ENABLED:-1}" = 0 ]; then
         printf '自动认证: 已停用（ENABLED=0）\n'
@@ -954,7 +971,7 @@ do_status() {
     fi
 
     printf 'HTTP 客户端: %s\n' "${HTTP_CLIENT:-无}"
-    printf 'WAN 接口: %s\n' "$WAN_IF"
+    printf 'WAN 接口: %s\n' "${WAN_IF:-自动}"
 
     _ds_ip=$(get_wan_ip 2>/dev/null || true)
     printf 'WAN IP: %s\n' "${_ds_ip:-未获取}"
@@ -995,7 +1012,7 @@ do_test() {
     printf '配置文件: %s\n' "$CONFIG_FILE"
     printf '门户: %s\n' "$(portal_base)"
     printf '账号: %s\n' "${ACCOUNT_PREFIX}${USERNAME}${ISP_SUFFIX}"
-    printf 'WAN 接口: %s\n' "$WAN_IF"
+    printf 'WAN 接口: %s\n' "${WAN_IF:-自动}"
     printf 'WAN IP: %s\n' "${_dt_ip:-未获取}"
     printf 'MAC: %s\n' "$_dt_mac"
     printf '请求: %s\n' "$(mask_password_url "$_dt_url")"
@@ -1077,7 +1094,7 @@ watch_loop() {
 
     if ! is_disabled; then
         if ! ( validate_config ) >/dev/null 2>&1; then
-            log "配置无效，自动认证暂不启动；修复配置后请执行 /etc/init.d/hnu-campus restart"
+            log "配置无效，自动认证暂不启动；修复配置后请执行 systemctl restart hnu-campus"
             while :; do
                 sleep 60
                 load_config

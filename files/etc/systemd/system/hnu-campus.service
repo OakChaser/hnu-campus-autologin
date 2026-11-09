@@ -1,0 +1,29 @@
+[Unit]
+Description=HNU campus network Dr.COM auto-login
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/hnu-campus watch
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+Nice=10
+RuntimeDirectory=hnu-campus
+RuntimeDirectoryMode=0700
+ReadWritePaths=/run/hnu-campus /var/log
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

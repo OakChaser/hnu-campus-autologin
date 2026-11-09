@@ -1,0 +1,20 @@
+#!/bin/sh
+
+[ -x /usr/local/sbin/hnu-campus ] || exit 0
+[ -r /etc/hnu-campus.conf ] || exit 0
+
+case "${2:-}" in
+    up|dhcp4-change|connectivity-change|reapply)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+. /etc/hnu-campus.conf 2>/dev/null || exit 0
+
+if [ -n "${WAN_IF:-}" ] && [ "${1:-}" != "$WAN_IF" ]; then
+    exit 0
+fi
+
+( /usr/local/sbin/hnu-campus check --quiet ) >/dev/null 2>&1 &
